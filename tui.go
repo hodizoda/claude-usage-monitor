@@ -63,7 +63,6 @@ type fetchResultMsg struct {
 }
 
 type model struct {
-	apiKey       string
 	subscription string
 	tier         string
 	interval     time.Duration
@@ -76,9 +75,8 @@ type model struct {
 	quit        bool
 }
 
-func newModel(apiKey, subscription, tier string, interval time.Duration) model {
+func newModel(subscription, tier string, interval time.Duration) model {
 	return model{
-		apiKey:       apiKey,
 		subscription: subscription,
 		tier:         tier,
 		interval:     interval,
@@ -93,7 +91,7 @@ func (m model) Init() tea.Cmd {
 
 func (m model) fetchCmd() tea.Cmd {
 	return func() tea.Msg {
-		info, err := fetchUsage(m.apiKey)
+		info, err := fetchUsage()
 		return fetchResultMsg{info: info, err: err}
 	}
 }
@@ -297,8 +295,8 @@ func (m model) View() string {
 	return cardStyle.Render(strings.Join(lines, "\n"))
 }
 
-func runTUI(apiKey, subscription, tier string, interval time.Duration) error {
-	m := newModel(apiKey, subscription, tier, interval)
+func runTUI(subscription, tier string, interval time.Duration) error {
+	m := newModel(subscription, tier, interval)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
 	return err

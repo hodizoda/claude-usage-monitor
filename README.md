@@ -87,13 +87,19 @@ JSON output:
 
 ## Authentication
 
-Reads the OAuth access token from `~/.claude/.credentials.json` (the file Claude Code writes when you `claude login`). The token is used as `x-api-key` on the probe call.
+Reads the OAuth access token from `~/.claude/.credentials.json` (the file Claude Code writes when you `claude login`).
+
+Subscription tokens are OAuth bearers, not API keys — the probe sends them as `Authorization: Bearer <token>` together with `anthropic-beta: oauth-2025-04-20`. Sent as `x-api-key` they get a flat `401`.
+
+The credentials file is re-read on every refresh, so when Claude Code rotates the access token a running TUI picks up the new one instead of dying at expiry.
 
 If you don't have Claude Code installed, log in once at <https://claude.ai/code> via the CLI to populate the credentials file.
 
 ## Cost
 
 Each refresh costs one minimum-size Haiku request (8 input tokens, 1 output token). At default 30-second refresh that's ~120 calls/hour — well under a cent per day.
+
+The probe is itself billed against the subscription, so the tool contributes a small amount to the utilization it reports.
 
 ## Requirements
 

@@ -60,14 +60,31 @@ func loadCredentials() (*Credentials, error) {
 	return &creds, nil
 }
 
-func fetchUsage(apiKey string) (*RateLimitInfo, error) {
+// apiBase is the API root. A variable so tests can point it at httptest.
+var apiBase = "https://api.anthropic.com"
+
+// fetchUsage re-reads the credentials file on every call. Claude Code refreshes
+// the OAuth access token in place, and a long-running TUI outlives one token.
+func fetchUsage() (*RateLimitInfo, error) {
+	creds, err := loadCredentials()
+	if err != nil {
+		return nil, err
+	}
+	token := creds.ClaudeAiOauth.AccessToken
+	if token == "" {
+		return nil, fmt.Errorf("no access token in credentials")
+	}
+
 	body := `{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`
-	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewBufferString(body))
+	req, err := http.NewRequest("POST", apiBase+"/v1/messages", bytes.NewBufferString(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", apiKey)
+	// Claude Code subscription tokens are OAuth bearers, not API keys. Sent as
+	// x-api-key they get a flat 401; the beta header is what admits them.
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 	req.Header.Set("anthropic-version", "2023-06-01")
 
 	client := &http.Client{Timeout: 15 * time.Second}
@@ -76,11 +93,12 @@ func fetchUsage(apiKey string) (*RateLimitInfo, error) {
 		return nil, fmt.Errorf("api call: %w", err)
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("api returned %d", resp.StatusCode)
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 400))
+		return nil, fmt.Errorf("api returned %d: %s", resp.StatusCode, bytes.TrimSpace(msg))
 	}
+	io.Copy(io.Discard, resp.Body)
 
 	h := resp.Header
 	return &RateLimitInfo{

@@ -25,8 +25,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error loading credentials: %v\n", err)
 		os.Exit(1)
 	}
-	apiKey := creds.ClaudeAiOauth.AccessToken
-	if apiKey == "" {
+	if creds.ClaudeAiOauth.AccessToken == "" {
 		fmt.Fprintln(os.Stderr, "No access token found in credentials")
 		os.Exit(1)
 	}
@@ -35,13 +34,12 @@ func main() {
 		// Force truecolor so the preview shows the two-tone bar even when
 		// stdout isn't a TTY.
 		lipgloss.SetColorProfile(termenv.TrueColor)
-		info, err := fetchUsage(apiKey)
+		info, err := fetchUsage()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		m := newModel(apiKey,
-			creds.ClaudeAiOauth.SubscriptionType,
+		m := newModel(creds.ClaudeAiOauth.SubscriptionType,
 			creds.ClaudeAiOauth.RateLimitTier,
 			*interval)
 		m.info = info
@@ -53,7 +51,7 @@ func main() {
 	}
 
 	if *jsonOut || *once {
-		info, err := fetchUsage(apiKey)
+		info, err := fetchUsage()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -68,8 +66,7 @@ func main() {
 		return
 	}
 
-	if err := runTUI(apiKey,
-		creds.ClaudeAiOauth.SubscriptionType,
+	if err := runTUI(creds.ClaudeAiOauth.SubscriptionType,
 		creds.ClaudeAiOauth.RateLimitTier,
 		*interval); err != nil {
 		fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
