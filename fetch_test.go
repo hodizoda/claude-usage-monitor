@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -119,16 +120,7 @@ func TestFetchUsageErrorIncludesBody(t *testing.T) {
 	if err == nil {
 		t.Fatal("want an error")
 	}
-	if want := "OAuth authentication is currently not supported."; !contains(err.Error(), want) {
+	if want := "OAuth authentication is currently not supported."; !strings.Contains(err.Error(), want) {
 		t.Errorf("error = %q, want it to quote the API message", err)
 	}
-}
-
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }
