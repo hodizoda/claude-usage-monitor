@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -86,19 +87,21 @@ type model struct {
 
 	// The health ping costs tokens and lands in the 5-hour window this tool
 	// reports, so it runs on its own, much slower clock. Zero disables it.
+	jitter       time.Duration
 	pingInterval time.Duration
 	health       *Health
 	pinging      bool
 	nextPingAt   time.Time
 }
 
-func newModel(subscription, tier string, interval, pingInterval time.Duration) model {
+func newModel(subscription, tier string, interval, jitter, pingInterval time.Duration) model {
 	return model{
 		subscription: subscription,
 		tier:         tier,
 		interval:     interval,
+		jitter:       jitter,
 		fetching:     true,
-		nextFetchAt:  time.Now().Add(interval),
+		nextFetchAt:  time.Now().Add(nextInterval(interval, jitter)),
 		pingInterval: pingInterval,
 		pinging:      pingInterval > 0,
 		nextPingAt:   time.Now().Add(pingInterval),
@@ -137,7 +140,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			if !m.fetching {
 				m.fetching = true
-				m.nextFetchAt = time.Now().Add(m.interval)
+				m.nextFetchAt = time.Now().Add(nextInterval(m.interval, m.jitter))
 				return m, m.fetchCmd()
 			}
 		}
@@ -153,7 +156,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = nil
 			m.info = msg.info
 			m.backoff = 0
-			m.nextFetchAt = m.lastFetch.Add(m.interval)
+			m.nextFetchAt = m.lastFetch.Add(nextInterval(m.interval, m.jitter))
 		}
 
 	case healthMsg:
@@ -355,8 +358,8 @@ func (m model) View() string {
 	return cardStyle.Render(strings.Join(lines, "\n"))
 }
 
-func runTUI(subscription, tier string, interval, pingInterval time.Duration) error {
-	m := newModel(subscription, tier, interval, pingInterval)
+func runTUI(subscription, tier string, interval, jitter, pingInterval time.Duration) error {
+	m := newModel(subscription, tier, interval, jitter, pingInterval)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
 	return err
@@ -422,4 +425,14 @@ func truncate(s string, width int) string {
 		return string(r[:width])
 	}
 	return string(r[:width-1]) + "…"
+}
+
+// nextInterval spreads the refresh over [interval, interval+jitter]. A fixed
+// period lines up with everything else polling the same endpoint — Claude Code
+// reads it too — and aligned clients are what turn a shared budget into a 429.
+func nextInterval(interval, jitter time.Duration) time.Duration {
+	if jitter <= 0 {
+		return interval
+	}
+	return interval + time.Duration(rand.Int64N(int64(jitter)+1))
 }

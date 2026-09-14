@@ -57,7 +57,7 @@ func TestRestMessageCountsDown(t *testing.T) {
 // The card has to actually reach the screen: a limited ping must render the
 // cat and the countdown, not the ordinary health line.
 func TestViewShowsCoolDownCardWhenLimited(t *testing.T) {
-	m := newModel("max", "default_claude_max_5x", 30*time.Second, 30*time.Minute)
+	m := newModel("max", "default_claude_max_5x", 30*time.Second, 20*time.Second, 30*time.Minute)
 	m.fetching = false
 	m.info = &RateLimitInfo{
 		FiveHour: Window{Utilization: 1, Reset: time.Now().Add(90 * time.Minute).Unix()},
@@ -140,7 +140,7 @@ func TestNextBackoffSpacesOutRetries(t *testing.T) {
 
 // The card is a fixed-width box: a multi-line JSON body must never reach it.
 func TestViewKeepsRateLimitErrorInsideTheCard(t *testing.T) {
-	m := newModel("max", "default_claude_max_20x", 30*time.Second, 30*time.Minute)
+	m := newModel("max", "default_claude_max_20x", 30*time.Second, 20*time.Second, 30*time.Minute)
 	m.fetching = false
 	m.err = &APIError{Status: 429, Message: "Rate limited. Please try again later."}
 	m.nextFetchAt = time.Now().Add(30 * time.Second)
@@ -158,7 +158,7 @@ func TestViewKeepsRateLimitErrorInsideTheCard(t *testing.T) {
 // The pet has to appear on the data alone. Waiting for a ping to be refused
 // means it only shows up after the interruption it is warning about.
 func TestViewShowsPetWhenAWindowIsSpent(t *testing.T) {
-	m := newModel("max", "default_claude_max_20x", time.Minute, 30*time.Minute)
+	m := newModel("max", "default_claude_max_20x", 30*time.Second, 20*time.Second, 30*time.Minute)
 	m.fetching = false
 	healthy := Health{Kind: HealthOK, At: time.Now()}
 	m.health = &healthy
@@ -193,5 +193,33 @@ func TestCappedIgnoresEmptyInfo(t *testing.T) {
 	}
 	if capped(&RateLimitInfo{}) {
 		t.Error("an empty payload must not read as capped")
+	}
+}
+
+// Every refresh must land inside [interval, interval+jitter], and must not
+// always land on the same value — a fixed period is what aligns this client
+// with everything else polling the endpoint.
+func TestNextIntervalStaysInRangeAndVaries(t *testing.T) {
+	const (
+		base   = 30 * time.Second
+		jitter = 20 * time.Second
+	)
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 500; i++ {
+		d := nextInterval(base, jitter)
+		if d < base || d > base+jitter {
+			t.Fatalf("interval %v outside [%v, %v]", d, base, base+jitter)
+		}
+		seen[d] = true
+	}
+	if len(seen) < 10 {
+		t.Errorf("%d distinct delays in 500 draws, want a spread", len(seen))
+	}
+
+	// Zero jitter is a fixed period, for anyone who wants one.
+	for i := 0; i < 10; i++ {
+		if d := nextInterval(base, 0); d != base {
+			t.Fatalf("interval %v with no jitter, want %v", d, base)
+		}
 	}
 }

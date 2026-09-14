@@ -17,9 +17,11 @@ func main() {
 	once := flag.Bool("once", false, "Print usage once and exit (no TUI)")
 	jsonOut := flag.Bool("json", false, "Print usage as JSON and exit (implies --once)")
 	preview := flag.Bool("preview", false, "Render one frame of the TUI to stdout and exit")
-	// 30s polling earns a 429 from the usage endpoint's own budget; the numbers
-	// move slowly enough that a minute loses nothing.
-	interval := flag.Duration("interval", time.Minute, "Refresh interval for TUI mode")
+	// The refresh is spread over [interval, interval+jitter]: a fixed period
+	// lines up with Claude Code's own polling of the same endpoint, and aligned
+	// clients are what earn a 429 from its shared budget.
+	interval := flag.Duration("interval", 30*time.Second, "Minimum refresh interval for TUI mode")
+	jitter := flag.Duration("jitter", 20*time.Second, "Random extra delay added to each refresh (0 for a fixed interval)")
 	// The usage read is a free GET; the health ping is a real inference call
 	// that lands in the 5-hour window, so it gets its own, slower clock.
 	pingInterval := flag.Duration("ping-interval", 30*time.Minute, "How often to ping Haiku to check the API is up (0 disables)")
@@ -52,7 +54,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		m := newModel(subscription, tier, *interval, *pingInterval)
+		m := newModel(subscription, tier, *interval, *jitter, *pingInterval)
 		m.info = info
 		m.fetching = false
 		m.lastFetch = time.Now()
@@ -85,7 +87,7 @@ func main() {
 		return
 	}
 
-	if err := runTUI(subscription, tier, *interval, *pingInterval); err != nil {
+	if err := runTUI(subscription, tier, *interval, *jitter, *pingInterval); err != nil {
 		fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
 		os.Exit(1)
 	}
