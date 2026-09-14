@@ -34,6 +34,12 @@ It returns the 5-hour window, the all-models weekly window, any **per-model week
 limit** ("Current week (Fable)"), a breakdown of where the week went by surface,
 and the extra-usage/credits state.
 
+The plan shown in the footer comes from `GET /api/oauth/profile`, not from the
+credentials file: that file records the rate-limit tier as it was at the last
+login, so an upgraded account keeps reading as its old tier until the next
+`claude login`. Only the organization's plan and tier are decoded from that
+response. If the call fails, the credentials file is used as a fallback.
+
 An earlier version of this tool read `anthropic-ratelimit-unified-*` response
 headers off a 1-token Haiku call instead. Those headers are real and still work,
 but they carry no per-model window, and the probe itself costs usage.

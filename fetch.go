@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -131,6 +132,65 @@ func authRequest(method, url string, body io.Reader) (*http.Request, error) {
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 	req.Header.Set("anthropic-version", "2023-06-01")
 	return req, nil
+}
+
+// Profile is the account's plan, read from the API rather than from the
+// credentials file: that file records the tier as it was at the last login and
+// goes stale the moment the plan changes.
+type Profile struct {
+	Subscription string // "max"
+	Tier         string // "default_claude_max_20x"
+}
+
+func fetchProfile() (*Profile, error) {
+	req, err := authRequest("GET", apiBase+"/api/oauth/profile", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("profile call: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("profile returned %d: %s", resp.StatusCode, readSnippet(resp.Body))
+	}
+
+	// The endpoint also carries name and email. Only the plan is decoded —
+	// nothing else belongs in this tool's memory.
+	var body struct {
+		Organization struct {
+			OrganizationType string `json:"organization_type"`
+			RateLimitTier    string `json:"rate_limit_tier"`
+		} `json:"organization"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("parse profile: %w", err)
+	}
+	return &Profile{
+		Subscription: strings.TrimPrefix(body.Organization.OrganizationType, "claude_"),
+		Tier:         body.Organization.RateLimitTier,
+	}, nil
+}
+
+// planLabel renders the footer's plan, e.g. "max (20x)".
+func planLabel(subscription, tier string) string {
+	if subscription == "" {
+		subscription = "unknown"
+	}
+	if tier == "" {
+		return subscription
+	}
+	// "default_claude_max_20x" -> "20x"
+	if i := strings.LastIndex(tier, "_"); i >= 0 {
+		tier = tier[i+1:]
+	}
+	if tier == "" || tier == subscription {
+		return subscription
+	}
+	return subscription + " (" + tier + ")"
 }
 
 // fetchUsage reads the usage panel's own endpoint. It is a plain GET: no

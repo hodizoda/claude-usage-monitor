@@ -160,3 +160,44 @@ func TestFetchUsageErrorIncludesBody(t *testing.T) {
 		t.Errorf("error = %q, want it to quote the API message", err)
 	}
 }
+
+// The credentials file records the tier at login time and goes stale on a plan
+// change — a 20x account was being shown as "max (5x)". The profile endpoint is
+// the source of truth.
+func TestFetchProfileReadsLivePlan(t *testing.T) {
+	writeCreds(t, "t")
+	var gotPath string
+	serveUsage(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Write([]byte(`{
+		  "account": {"email": "someone@example.com", "full_name": "Someone"},
+		  "organization": {"organization_type": "claude_max",
+		                   "rate_limit_tier": "default_claude_max_20x"}}`))
+	})
+
+	prof, err := fetchProfile()
+	if err != nil {
+		t.Fatalf("fetchProfile: %v", err)
+	}
+	if gotPath != "/api/oauth/profile" {
+		t.Errorf("path = %q, want /api/oauth/profile", gotPath)
+	}
+	if prof.Subscription != "max" || prof.Tier != "default_claude_max_20x" {
+		t.Errorf("profile = %+v, want max / default_claude_max_20x", prof)
+	}
+}
+
+func TestPlanLabel(t *testing.T) {
+	cases := []struct{ sub, tier, want string }{
+		{"max", "default_claude_max_20x", "max (20x)"},
+		{"max", "default_claude_max_5x", "max (5x)"},
+		{"pro", "", "pro"},
+		{"", "", "unknown"},
+		{"max", "max", "max"}, // no parenthetical that just repeats the plan
+	}
+	for _, c := range cases {
+		if got := planLabel(c.sub, c.tier); got != c.want {
+			t.Errorf("planLabel(%q, %q) = %q, want %q", c.sub, c.tier, got, c.want)
+		}
+	}
+}

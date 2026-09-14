@@ -34,6 +34,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The credentials file's tier is a snapshot from the last login and goes
+	// stale on a plan change; the profile endpoint is authoritative and free.
+	subscription, tier := creds.ClaudeAiOauth.SubscriptionType, creds.ClaudeAiOauth.RateLimitTier
+	if prof, err := fetchProfile(); err == nil {
+		subscription, tier = prof.Subscription, prof.Tier
+	}
+
 	if *preview {
 		// Force truecolor so the preview shows the two-tone bar even when
 		// stdout isn't a TTY.
@@ -43,9 +50,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		m := newModel(creds.ClaudeAiOauth.SubscriptionType,
-			creds.ClaudeAiOauth.RateLimitTier,
-			*interval, *pingInterval)
+		m := newModel(subscription, tier, *interval, *pingInterval)
 		m.info = info
 		m.fetching = false
 		m.lastFetch = time.Now()
@@ -73,21 +78,19 @@ func main() {
 				Health *Health `json:"health,omitempty"`
 			}{info, health})
 		} else {
-			printPlain(info, health, creds.ClaudeAiOauth.SubscriptionType, creds.ClaudeAiOauth.RateLimitTier)
+			printPlain(info, health, subscription, tier)
 		}
 		return
 	}
 
-	if err := runTUI(creds.ClaudeAiOauth.SubscriptionType,
-		creds.ClaudeAiOauth.RateLimitTier,
-		*interval, *pingInterval); err != nil {
+	if err := runTUI(subscription, tier, *interval, *pingInterval); err != nil {
 		fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
 func printPlain(info *RateLimitInfo, health *Health, sub, tier string) {
-	fmt.Printf("Subscription: %s  Tier: %s\n\n", sub, tier)
+	fmt.Printf("Plan: %s\n\n", planLabel(sub, tier))
 
 	plainBar := func(pct float64, w int) string {
 		filled := int(math.Round(pct * float64(w)))

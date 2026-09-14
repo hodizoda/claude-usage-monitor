@@ -302,15 +302,7 @@ func (m model) View() string {
 	}
 
 	// Footer: two halves, subscription left, status/keys right.
-	sub := m.subscription
-	if m.tier != "" {
-		// Abbreviate "default_claude_max_5x" → "5x".
-		tier := m.tier
-		if idx := strings.LastIndex(tier, "_"); idx >= 0 {
-			tier = tier[idx+1:]
-		}
-		sub = sub + " (" + tier + ")"
-	}
+	sub := planLabel(m.subscription, m.tier)
 
 	var rightSide string
 	switch {
