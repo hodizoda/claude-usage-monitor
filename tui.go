@@ -54,9 +54,13 @@ var (
 
 	errorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#E5484D"))
+
+	restStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#F5A524"))
 )
 
 type tickMsg time.Time
+type healthMsg Health
 type fetchResultMsg struct {
 	info *RateLimitInfo
 	err  error
@@ -73,19 +77,32 @@ type model struct {
 	lastFetch   time.Time
 	nextFetchAt time.Time
 	quit        bool
+
+	// The health ping costs tokens and lands in the 5-hour window this tool
+	// reports, so it runs on its own, much slower clock. Zero disables it.
+	pingInterval time.Duration
+	health       *Health
+	pinging      bool
+	nextPingAt   time.Time
 }
 
-func newModel(subscription, tier string, interval time.Duration) model {
+func newModel(subscription, tier string, interval, pingInterval time.Duration) model {
 	return model{
 		subscription: subscription,
 		tier:         tier,
 		interval:     interval,
 		fetching:     true,
 		nextFetchAt:  time.Now().Add(interval),
+		pingInterval: pingInterval,
+		pinging:      pingInterval > 0,
+		nextPingAt:   time.Now().Add(pingInterval),
 	}
 }
 
 func (m model) Init() tea.Cmd {
+	if m.pingInterval > 0 {
+		return tea.Batch(m.fetchCmd(), m.tickCmd(), m.pingCmd())
+	}
 	return tea.Batch(m.fetchCmd(), m.tickCmd())
 }
 
@@ -94,6 +111,10 @@ func (m model) fetchCmd() tea.Cmd {
 		info, err := fetchUsage()
 		return fetchResultMsg{info: info, err: err}
 	}
+}
+
+func (m model) pingCmd() tea.Cmd {
+	return func() tea.Msg { return healthMsg(probeHealth()) }
 }
 
 func (m model) tickCmd() tea.Cmd {
@@ -126,14 +147,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.info = msg.info
 		}
 
+	case healthMsg:
+		h := Health(msg)
+		m.pinging = false
+		m.health = &h
+		m.nextPingAt = time.Now().Add(m.pingInterval)
+
 	case tickMsg:
 		// Every second: redraw for the live countdown. If it's time to refetch
 		// and we aren't already, fire off a new fetch.
+		cmds := []tea.Cmd{m.tickCmd()}
 		if !m.fetching && time.Now().After(m.nextFetchAt) {
 			m.fetching = true
-			return m, tea.Batch(m.fetchCmd(), m.tickCmd())
+			cmds = append(cmds, m.fetchCmd())
 		}
-		return m, m.tickCmd()
+		if m.pingInterval > 0 && !m.pinging && time.Now().After(m.nextPingAt) {
+			m.pinging = true
+			cmds = append(cmds, m.pingCmd())
+		}
+		return m, tea.Batch(cmds...)
 	}
 	return m, nil
 }
@@ -215,39 +247,58 @@ func (m model) View() string {
 		body.WriteString("\n")
 		body.WriteString(row(
 			"5-hour window",
-			"Resets in "+formatResetRelative(info.FiveHourReset),
-			info.FiveHourUtilization,
+			"Resets in "+formatResetRelative(info.FiveHour.Reset),
+			info.FiveHour.Utilization,
 			innerW,
 		))
 		body.WriteString("\n")
 
-		// Weekly limits (7-day window)
+		// Weekly limits: the all-models window, then any per-model window.
 		body.WriteString(sectionStyle.Render("Weekly limits"))
 		body.WriteString("\n")
 		body.WriteString(row(
 			"All models",
-			"Resets "+formatResetAbsolute(info.SevenDayReset),
-			info.SevenDayUtilization,
+			"Resets "+formatResetAbsolute(info.SevenDay.Reset),
+			info.SevenDay.Utilization,
 			innerW,
 		))
+		for _, sl := range info.ScopedWeekly {
+			body.WriteString("\n")
+			body.WriteString(row(
+				sl.Label+" only",
+				"Resets "+formatResetAbsolute(sl.Reset),
+				sl.Utilization,
+				innerW,
+			))
+		}
 		body.WriteString("\n")
 
-		// Status line
-		var status strings.Builder
-		status.WriteString("Status: ")
-		switch info.Status {
-		case "allowed":
-			status.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#30A46C")).Render("allowed"))
-		case "rejected":
-			status.WriteString(errorStyle.Render("rejected"))
-		default:
-			status.WriteString(info.Status)
+		// Where the week went, when the API tells us.
+		if len(info.Breakdown) > 0 {
+			parts := make([]string, 0, len(info.Breakdown))
+			for _, b := range info.Breakdown {
+				parts = append(parts, fmt.Sprintf("%s %.0f%%", b.Label, b.Percent))
+			}
+			body.WriteString("\n")
+			body.WriteString(dimStyle.Render(strings.Join(parts, " · ")))
 		}
-		status.WriteString(dimStyle.Render(
-			fmt.Sprintf(" · binding: %s · overage: %s",
-				info.RepresentativeClaim, info.OverageStatus)))
+
+		// Health line: separate clock, so it can be absent early on.
 		body.WriteString("\n")
-		body.WriteString(status.String())
+		if m.health == nil {
+			if m.pingInterval > 0 {
+				body.WriteString(dimStyle.Render("Checking API…"))
+			}
+		} else if m.health.Kind == HealthLimited {
+			// Nothing to do but wait, so the card says exactly how long.
+			body.WriteString("\n")
+			body.WriteString(restStyle.Render(restingCat))
+			body.WriteString("\n")
+			body.WriteString(healthStyle(HealthLimited).Render(restMessage(info)))
+		} else {
+			body.WriteString(healthStyle(m.health.Kind).Render(m.health.Summary()))
+			body.WriteString(dimStyle.Render(" · " + formatAgo(m.health.At)))
+		}
 	}
 
 	// Footer: two halves, subscription left, status/keys right.
@@ -295,9 +346,33 @@ func (m model) View() string {
 	return cardStyle.Render(strings.Join(lines, "\n"))
 }
 
-func runTUI(subscription, tier string, interval time.Duration) error {
-	m := newModel(subscription, tier, interval)
+func runTUI(subscription, tier string, interval, pingInterval time.Duration) error {
+	m := newModel(subscription, tier, interval, pingInterval)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
 	return err
+}
+
+// healthStyle colours the health line: only an unreachable API is an error.
+// Being rate limited is the tool's normal state near a limit.
+func healthStyle(k HealthKind) lipgloss.Style {
+	switch k {
+	case HealthOK:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#30A46C"))
+	case HealthDown, HealthAuth:
+		return errorStyle
+	default:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#F5A524"))
+	}
+}
+
+func formatAgo(t time.Time) string {
+	d := time.Since(t)
+	if d < time.Minute {
+		return "just now"
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	}
+	return fmt.Sprintf("%dh ago", int(d.Hours()))
 }

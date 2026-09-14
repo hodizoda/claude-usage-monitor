@@ -18,6 +18,10 @@ func main() {
 	jsonOut := flag.Bool("json", false, "Print usage as JSON and exit (implies --once)")
 	preview := flag.Bool("preview", false, "Render one frame of the TUI to stdout and exit")
 	interval := flag.Duration("interval", 30*time.Second, "Refresh interval for TUI mode")
+	// The usage read is a free GET; the health ping is a real inference call
+	// that lands in the 5-hour window, so it gets its own, slower clock.
+	pingInterval := flag.Duration("ping-interval", 30*time.Minute, "How often to ping Haiku to check the API is up (0 disables)")
+	ping := flag.Bool("ping", false, "Include one health ping in --once / --json output")
 	flag.Parse()
 
 	creds, err := loadCredentials()
@@ -41,7 +45,7 @@ func main() {
 		}
 		m := newModel(creds.ClaudeAiOauth.SubscriptionType,
 			creds.ClaudeAiOauth.RateLimitTier,
-			*interval)
+			*interval, *pingInterval)
 		m.info = info
 		m.fetching = false
 		m.lastFetch = time.Now()
@@ -56,25 +60,33 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+		var health *Health
+		if *ping {
+			h := probeHealth()
+			health = &h
+		}
 		if *jsonOut {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
-			enc.Encode(info)
+			enc.Encode(struct {
+				*RateLimitInfo
+				Health *Health `json:"health,omitempty"`
+			}{info, health})
 		} else {
-			printPlain(info, creds.ClaudeAiOauth.SubscriptionType, creds.ClaudeAiOauth.RateLimitTier)
+			printPlain(info, health, creds.ClaudeAiOauth.SubscriptionType, creds.ClaudeAiOauth.RateLimitTier)
 		}
 		return
 	}
 
 	if err := runTUI(creds.ClaudeAiOauth.SubscriptionType,
 		creds.ClaudeAiOauth.RateLimitTier,
-		*interval); err != nil {
+		*interval, *pingInterval); err != nil {
 		fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func printPlain(info *RateLimitInfo, sub, tier string) {
+func printPlain(info *RateLimitInfo, health *Health, sub, tier string) {
 	fmt.Printf("Subscription: %s  Tier: %s\n\n", sub, tier)
 
 	plainBar := func(pct float64, w int) string {
@@ -88,14 +100,27 @@ func printPlain(info *RateLimitInfo, sub, tier string) {
 		return strings.Repeat("█", filled) + strings.Repeat("░", w-filled)
 	}
 
-	fmt.Printf("Current session (5h)   [%s] %5.1f%%\n",
-		plainBar(info.FiveHourUtilization, 30), info.FiveHourUtilization*100)
-	fmt.Printf("  Resets in %s\n\n", formatResetRelative(info.FiveHourReset))
+	line := func(label string, u float64, reset string) {
+		fmt.Printf("%-22s [%s] %5.1f%%\n  Resets %s\n\n", label, plainBar(u, 30), u*100, reset)
+	}
 
-	fmt.Printf("Weekly (7d)            [%s] %5.1f%%\n",
-		plainBar(info.SevenDayUtilization, 30), info.SevenDayUtilization*100)
-	fmt.Printf("  Resets %s\n\n", formatResetAbsolute(info.SevenDayReset))
+	line("Current session (5h)", info.FiveHour.Utilization, "in "+formatResetRelative(info.FiveHour.Reset))
+	line("Weekly (7d)", info.SevenDay.Utilization, formatResetAbsolute(info.SevenDay.Reset))
+	for _, sl := range info.ScopedWeekly {
+		line("Weekly ("+sl.Label+")", sl.Utilization, formatResetAbsolute(sl.Reset))
+	}
 
-	fmt.Printf("Status: %s · binding: %s · overage: %s\n",
-		info.Status, info.RepresentativeClaim, info.OverageStatus)
+	if len(info.Breakdown) > 0 {
+		parts := make([]string, 0, len(info.Breakdown))
+		for _, b := range info.Breakdown {
+			parts = append(parts, fmt.Sprintf("%s %.0f%%", b.Label, b.Percent))
+		}
+		fmt.Printf("Week so far: %s\n", strings.Join(parts, " · "))
+	}
+	if health != nil {
+		fmt.Printf("Health: %s\n", health.Summary())
+		if health.Kind == HealthLimited {
+			fmt.Printf("\n%s\n%s\n", restingCat, restMessage(info))
+		}
+	}
 }

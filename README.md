@@ -26,19 +26,52 @@ A terminal UI that shows your Claude Max subscription's rate-limit state — cur
 
 ## How it works
 
-The Claude Code CLI's `/usage` dialog isn't backed by a separate API — the data comes back as response headers on every `/v1/messages` call:
+`GET /api/oauth/usage` — the endpoint behind the CLI's own `/usage` panel. It is a
+plain authenticated GET: no inference call, nothing billed, and no contribution to
+the numbers it reports.
 
-| Header | Meaning |
+It returns the 5-hour window, the all-models weekly window, any **per-model weekly
+limit** ("Current week (Fable)"), a breakdown of where the week went by surface,
+and the extra-usage/credits state.
+
+An earlier version of this tool read `anthropic-ratelimit-unified-*` response
+headers off a 1-token Haiku call instead. Those headers are real and still work,
+but they carry no per-model window, and the probe itself costs usage.
+
+## Health check
+
+Usage data says nothing about whether the API is actually answering, so a separate,
+much slower ping (`--ping-interval`, default 30 min) sends one minimum-size Haiku
+request and classifies the result:
+
+| Result | Meaning |
 |--------|---------|
-| `anthropic-ratelimit-unified-5h-utilization` | Fraction of the 5-hour window used |
-| `anthropic-ratelimit-unified-5h-reset` | Unix timestamp when the 5-hour window resets |
-| `anthropic-ratelimit-unified-7d-utilization` | Fraction of the 7-day window used |
-| `anthropic-ratelimit-unified-7d-reset` | Unix timestamp when the 7-day window resets |
-| `anthropic-ratelimit-unified-status` | `allowed` or `rejected` |
-| `anthropic-ratelimit-unified-representative-claim` | Which window is the binding constraint |
-| `anthropic-ratelimit-unified-overage-status` | Overage allowed / rejected |
+| `ok` | Inference answered, with the round-trip time |
+| `limited` | HTTP 429 — the account is capped. **Not** an outage |
+| `auth` | 401/403 — the token, not the service |
+| `down` | 5xx, timeout, or no route to the API |
 
-This tool makes a 1-token Haiku call (the cheapest possible request) and reads those headers. No private endpoints, no scraping.
+`https://status.claude.com/api/v2/status.json` is read alongside it — no auth, no
+tokens. An ongoing incident is shown even when the ping succeeded, and if the ping
+fails while the status page reports no incident, the tool says so rather than
+blaming Anthropic for a local network fault.
+
+## Cool down
+
+On a 429 the card is replaced by the blocking window's countdown and a cat that has
+the right idea:
+
+```
+     |\      _,,,---,,_
+     /,`.-'`'    -.  ;-;;,_
+    |,4-  ) )-,_. ,\ (  `'-'
+   '---''(_/--'  `-'\_)
+Cool down 1 hr 33 min — 5-hour window resets. Rest.
+```
+
+The window named is the one actually blocking: every window at or above 99.5% is a
+candidate and the soonest to lift wins, so a full per-model weekly limit is not
+reported as a 5-hour wait.
 
 ## Install
 
@@ -57,33 +90,40 @@ go build -o claude-usage-monitor .
 ## Usage
 
 ```bash
-claude-usage-monitor                    # interactive TUI, refreshes every 30s
-claude-usage-monitor --interval 1m      # custom refresh interval
-claude-usage-monitor --once             # one-shot plain text
-claude-usage-monitor --json             # one-shot JSON (for scripting)
-claude-usage-monitor --preview          # render one TUI frame to stdout
+claude-usage-monitor                       # interactive TUI, refreshes every 30s
+claude-usage-monitor --interval 1m         # custom refresh interval
+claude-usage-monitor --ping-interval 0     # no health ping (usage data only)
+claude-usage-monitor --once                # one-shot plain text
+claude-usage-monitor --once --ping         # ...including one health ping
+claude-usage-monitor --json                # one-shot JSON (for scripting)
+claude-usage-monitor --preview             # render one TUI frame to stdout
 ```
 
 TUI keys: `r` to refresh now, `q` / `esc` / `ctrl-c` to quit.
 
-JSON output:
+JSON output (`health` appears only with `--ping`):
 
 ```json
 {
-  "timestamp": "2026-04-17T09:58:46Z",
-  "status": "allowed",
-  "five_hour_status": "allowed",
-  "five_hour_reset": 1776420000,
-  "five_hour_utilization": 0.2,
-  "seven_day_status": "allowed",
-  "seven_day_reset": 1776970800,
-  "seven_day_utilization": 0.06,
-  "representative_claim": "five_hour",
-  "fallback_percentage": 0.5,
-  "overage_status": "rejected",
-  "overage_disabled_reason": "org_level_disabled"
+  "timestamp": "2026-09-14T16:21:03Z",
+  "five_hour": { "utilization": 0.02, "reset": 1789408800 },
+  "seven_day": { "utilization": 0.83, "reset": 1789574400 },
+  "scoped_weekly": [
+    { "label": "Fable", "utilization": 1, "reset": 1789574400,
+      "severity": "critical", "active": true }
+  ],
+  "seven_day_breakdown": [
+    { "label": "Claude Code", "percent": 96 },
+    { "label": "Chats", "percent": 1 }
+  ],
+  "extra_usage_enabled": false,
+  "health": { "kind": "ok", "latency_ms": 621000000, "checked_at": "2026-09-14T16:21:03Z",
+              "status_page": { "indicator": "none", "description": "All Systems Operational" } }
 }
 ```
+
+Utilizations are fractions (0–1); the API reports them as 0–100 and they are
+converted on the way in.
 
 ## Authentication
 
@@ -97,9 +137,12 @@ If you don't have Claude Code installed, log in once at <https://claude.ai/code>
 
 ## Cost
 
-Each refresh costs one minimum-size Haiku request (8 input tokens, 1 output token). At default 30-second refresh that's ~120 calls/hour — well under a cent per day.
+Reading usage costs nothing — it is a GET, not an inference call, so the 30-second
+refresh is free.
 
-The probe is itself billed against the subscription, so the tool contributes a small amount to the utilization it reports.
+The health ping is a real request (8 input tokens, 1 output token) and does land in
+the 5-hour window this tool reports. At the default 30-minute interval that is 48
+calls a day, which is negligible but not zero. `--ping-interval 0` turns it off.
 
 ## Requirements
 
