@@ -2,7 +2,10 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"time"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 // restingCat is shown when the account is rate limited. There is nothing to do
@@ -57,4 +60,65 @@ func restMessage(info *RateLimitInfo) string {
 		return "Cool down over — " + label + " has reset."
 	}
 	return fmt.Sprintf("Cool down %s — %s resets. Rest.", formatResetRelative(reset), label)
+}
+
+// petPalette runs warm to cool — dusk over a sleeping cat. Stops are
+// interpolated, so adding one changes the ramp without touching the renderer.
+var petPalette = [][3]int{
+	{0xF5, 0xA5, 0x24}, // amber
+	{0xE5, 0x48, 0x4D}, // red
+	{0xC0, 0x4A, 0xAE}, // magenta
+	{0x8B, 0x5C, 0xF6}, // violet
+}
+
+// rampColor samples the palette at t in [0,1].
+func rampColor(t float64) lipgloss.Color {
+	if t < 0 {
+		t = 0
+	}
+	if t > 1 {
+		t = 1
+	}
+	span := float64(len(petPalette) - 1)
+	pos := t * span
+	i := int(pos)
+	if i >= len(petPalette)-1 {
+		i = len(petPalette) - 2
+	}
+	f := pos - float64(i)
+	a, b := petPalette[i], petPalette[i+1]
+	mix := func(n int) int { return int(float64(a[n]) + (float64(b[n])-float64(a[n]))*f) }
+	return lipgloss.Color(fmt.Sprintf("#%02X%02X%02X", mix(0), mix(1), mix(2)))
+}
+
+// renderPet paints the art on a diagonal ramp, top-left to bottom-right.
+// Spaces are left unstyled so the gradient costs nothing on empty cells.
+func renderPet(art string) string {
+	lines := strings.Split(art, "\n")
+	widest := 0
+	for _, l := range lines {
+		if n := len([]rune(l)); n > widest {
+			widest = n
+		}
+	}
+	if widest == 0 {
+		return art
+	}
+
+	var out strings.Builder
+	for y, line := range lines {
+		for x, r := range []rune(line) {
+			if r == ' ' {
+				out.WriteRune(r)
+				continue
+			}
+			// Average the two axes so the ramp reads diagonally.
+			t := (float64(x)/float64(widest) + float64(y)/float64(max(1, len(lines)-1))) / 2
+			out.WriteString(lipgloss.NewStyle().Foreground(rampColor(t)).Render(string(r)))
+		}
+		if y < len(lines)-1 {
+			out.WriteString("\n")
+		}
+	}
+	return out.String()
 }

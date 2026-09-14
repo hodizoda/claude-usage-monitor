@@ -1,9 +1,13 @@
 package main
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 func TestCooldownPicksTheBlockingLimit(t *testing.T) {
@@ -75,3 +79,28 @@ func TestViewShowsCoolDownCardWhenLimited(t *testing.T) {
 		t.Errorf("cool-down card shown while healthy:\n%s", out)
 	}
 }
+
+// The gradient must colour the art without altering it: same glyphs, more
+// than one colour, and spaces left alone.
+func TestRenderPetPaintsAGradient(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.TrueColor)
+
+	out := renderPet(restingCat)
+	if stripANSI(out) != restingCat {
+		t.Errorf("art changed:\n%q\nwant:\n%q", stripANSI(out), restingCat)
+	}
+	colors := map[string]bool{}
+	for _, m := range ansiColor.FindAllStringSubmatch(out, -1) {
+		colors[m[1]] = true
+	}
+	if len(colors) < 8 {
+		t.Errorf("%d distinct colours, want a real ramp", len(colors))
+	}
+}
+
+var (
+	ansiRE    = regexp.MustCompile("\x1b\\[[0-9;]*m")
+	ansiColor = regexp.MustCompile("\x1b\\[38;2;([0-9;]+)m")
+)
+
+func stripANSI(s string) string { return ansiRE.ReplaceAllString(s, "") }

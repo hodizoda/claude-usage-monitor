@@ -292,9 +292,9 @@ func (m model) View() string {
 		} else if m.health.Kind == HealthLimited {
 			// Nothing to do but wait, so the card says exactly how long.
 			body.WriteString("\n")
-			body.WriteString(restStyle.Render(restingCat))
+			body.WriteString(renderPet(restingCat))
 			body.WriteString("\n")
-			body.WriteString(healthStyle(HealthLimited).Render(restMessage(info)))
+			body.WriteString(restStyle.Render(restMessage(info)))
 		} else {
 			body.WriteString(healthStyle(m.health.Kind).Render(m.health.Summary()))
 			body.WriteString(dimStyle.Render(" · " + formatAgo(m.health.At)))
