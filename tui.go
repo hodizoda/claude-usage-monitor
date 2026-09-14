@@ -294,18 +294,24 @@ func (m model) View() string {
 			body.WriteString(dimStyle.Render(strings.Join(parts, " · ")))
 		}
 
+		// The pet appears whenever a window is spent — from the usage data
+		// itself, not only once a ping has been refused.
+		limited := m.health != nil && m.health.Kind == HealthLimited
+		if limited || capped(info) {
+			body.WriteString("\n\n")
+			body.WriteString(renderPet(restingCat))
+			body.WriteString("\n")
+			body.WriteString(restStyle.Render(restMessage(info)))
+		}
+
 		// Health line: separate clock, so it can be absent early on.
 		body.WriteString("\n")
 		if m.health == nil {
 			if m.pingInterval > 0 {
 				body.WriteString(dimStyle.Render("Checking API…"))
 			}
-		} else if m.health.Kind == HealthLimited {
-			// Nothing to do but wait, so the card says exactly how long.
-			body.WriteString("\n")
-			body.WriteString(renderPet(restingCat))
-			body.WriteString("\n")
-			body.WriteString(restStyle.Render(restMessage(info)))
+		} else if limited {
+			body.WriteString(dimStyle.Render("Checked " + formatAgo(m.health.At)))
 		} else {
 			body.WriteString(healthStyle(m.health.Kind).Render(m.health.Summary()))
 			body.WriteString(dimStyle.Render(" · " + formatAgo(m.health.At)))

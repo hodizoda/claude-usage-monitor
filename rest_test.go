@@ -66,7 +66,7 @@ func TestViewShowsCoolDownCardWhenLimited(t *testing.T) {
 	limited := Health{Kind: HealthLimited, At: time.Now()}
 	m.health = &limited
 
-	out := m.View()
+	out := stripANSI(m.View())
 	if !strings.Contains(out, "Cool down") {
 		t.Errorf("view has no cool-down line:\n%s", out)
 	}
@@ -74,10 +74,13 @@ func TestViewShowsCoolDownCardWhenLimited(t *testing.T) {
 		t.Errorf("view has no resting cat:\n%s", out)
 	}
 
+	// Healthy ping and room in every window: no card. The window has to be
+	// drained too, since a spent window now raises the card on its own.
 	ok := Health{Kind: HealthOK, At: time.Now(), Latency: 600 * time.Millisecond}
 	m.health = &ok
-	if out := m.View(); strings.Contains(out, "Cool down") {
-		t.Errorf("cool-down card shown while healthy:\n%s", out)
+	m.info.FiveHour.Utilization = 0.2
+	if out := stripANSI(m.View()); strings.Contains(out, "Cool down") {
+		t.Errorf("cool-down card shown while healthy and under the limits:\n%s", out)
 	}
 }
 
@@ -142,12 +145,53 @@ func TestViewKeepsRateLimitErrorInsideTheCard(t *testing.T) {
 	m.err = &APIError{Status: 429, Message: "Rate limited. Please try again later."}
 	m.nextFetchAt = time.Now().Add(30 * time.Second)
 
-	for _, line := range strings.Split(m.View(), "\n") {
+	for _, line := range strings.Split(stripANSI(m.View()), "\n") {
 		if lipgloss.Width(line) > 70 {
 			t.Errorf("line escapes the card (%d cols): %q", lipgloss.Width(line), line)
 		}
 	}
-	if out := m.View(); !strings.Contains(out, "Rate limited") || !strings.Contains(out, "Retrying in") {
+	if out := stripANSI(m.View()); !strings.Contains(out, "Rate limited") || !strings.Contains(out, "Retrying in") {
 		t.Errorf("view should say it is rate limited and when it retries:\n%s", out)
+	}
+}
+
+// The pet has to appear on the data alone. Waiting for a ping to be refused
+// means it only shows up after the interruption it is warning about.
+func TestViewShowsPetWhenAWindowIsSpent(t *testing.T) {
+	m := newModel("max", "default_claude_max_20x", time.Minute, 30*time.Minute)
+	m.fetching = false
+	healthy := Health{Kind: HealthOK, At: time.Now()}
+	m.health = &healthy
+
+	// Nothing spent: no pet.
+	m.info = &RateLimitInfo{
+		FiveHour: Window{Utilization: 0.02, Reset: time.Now().Add(3 * time.Hour).Unix()},
+		SevenDay: Window{Utilization: 0.83, Reset: time.Now().Add(40 * time.Hour).Unix()},
+	}
+	if strings.Contains(stripANSI(m.View()), "Cool down") {
+		t.Error("pet shown while nothing is spent")
+	}
+
+	// A per-model weekly limit at 100% is a real interruption, even though
+	// both top-level windows have room and no ping has failed.
+	m.info.ScopedWeekly = []ScopedLimit{{
+		Label: "Fable", Utilization: 1, Severity: "critical", Active: true,
+		Reset: time.Now().Add(40 * time.Hour).Unix(),
+	}}
+	out := stripANSI(m.View())
+	if !strings.Contains(out, "'---''(_/--'") {
+		t.Errorf("no pet with a spent per-model window:\n%s", out)
+	}
+	if !strings.Contains(out, "Fable weekly limit") {
+		t.Errorf("cool down should name the Fable limit:\n%s", out)
+	}
+}
+
+func TestCappedIgnoresEmptyInfo(t *testing.T) {
+	if capped(nil) {
+		t.Error("nil info must not read as capped")
+	}
+	if capped(&RateLimitInfo{}) {
+		t.Error("an empty payload must not read as capped")
 	}
 }

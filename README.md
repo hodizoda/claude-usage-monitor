@@ -64,8 +64,10 @@ blaming Anthropic for a local network fault.
 
 ## Cool down
 
-On a 429 the card is replaced by the blocking window's countdown and a cat that has
-the right idea:
+When any window is spent — the 5-hour one, the weekly one, or a per-model weekly
+limit — the card grows a countdown and a cat that has the right idea. A 429 from
+the health ping raises it too, but the usage data alone is enough: waiting for a
+refused request means the interruption has already happened.
 
 ```
      |\      _,,,---,,_

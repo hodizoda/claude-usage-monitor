@@ -15,6 +15,28 @@ const restingCat = `     |\      _,,,---,,_
     |,4-  ) )-,_. ,\ (  ` + "`" + `'-'
    '---''(_/--'  ` + "`" + `-'\_)`
 
+// capped reports whether some window is spent. This is the state that
+// interrupts work, and it is visible from the usage data alone — waiting for a
+// 429 to prove it means the interruption has already happened.
+func capped(info *RateLimitInfo) bool {
+	if info == nil {
+		return false
+	}
+	if info.FiveHour.Utilization >= blockingAt || info.SevenDay.Utilization >= blockingAt {
+		return true
+	}
+	for _, sl := range info.ScopedWeekly {
+		if sl.Utilization >= blockingAt {
+			return true
+		}
+	}
+	return false
+}
+
+// blockingAt is where a window counts as spent: the API rounds, and 100% is
+// reported as 1.0 slightly before the last token is gone.
+const blockingAt = 0.995
+
 // cooldown names the limit that is actually blocking and when it lifts.
 // A window counts as blocking at 99.5% — the API rounds, and 100% is reported
 // as 1.0 well before the last token is spent.
@@ -33,7 +55,7 @@ func cooldown(info *RateLimitInfo) (label string, reset int64) {
 	}
 
 	for _, c := range candidates {
-		if c.util < 0.995 || c.reset == 0 {
+		if c.util < blockingAt || c.reset == 0 {
 			continue
 		}
 		// Several limits can be full at once; the soonest one to lift is the
