@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -78,6 +79,11 @@ type model struct {
 	nextFetchAt time.Time
 	quit        bool
 
+	// Set after a rate-limited or failed fetch: the next attempt waits this
+	// long instead of the normal interval, so a 429 is not answered by more
+	// requests at the same rate.
+	backoff time.Duration
+
 	// The health ping costs tokens and lands in the 5-hour window this tool
 	// reports, so it runs on its own, much slower clock. Zero disables it.
 	pingInterval time.Duration
@@ -139,12 +145,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case fetchResultMsg:
 		m.fetching = false
 		m.lastFetch = time.Now()
-		m.nextFetchAt = m.lastFetch.Add(m.interval)
 		if msg.err != nil {
 			m.err = msg.err
+			m.backoff = nextBackoff(m.backoff, m.interval, msg.err)
+			m.nextFetchAt = m.lastFetch.Add(m.backoff)
 		} else {
 			m.err = nil
 			m.info = msg.info
+			m.backoff = 0
+			m.nextFetchAt = m.lastFetch.Add(m.interval)
 		}
 
 	case healthMsg:
@@ -233,7 +242,9 @@ func (m model) View() string {
 
 	if m.err != nil && m.info == nil {
 		body.WriteString("\n")
-		body.WriteString(errorStyle.Render("Error: " + m.err.Error()))
+		body.WriteString(errorStyle.Render(truncate(errorLine(m.err), innerW)))
+		body.WriteString("\n")
+		body.WriteString(dimStyle.Render("Retrying in " + time.Until(m.nextFetchAt).Round(time.Second).String()))
 		body.WriteString("\n")
 	} else if m.info == nil {
 		body.WriteString("\n")
@@ -367,4 +378,42 @@ func formatAgo(t time.Time) string {
 		return fmt.Sprintf("%dm ago", int(d.Minutes()))
 	}
 	return fmt.Sprintf("%dh ago", int(d.Hours()))
+}
+
+// nextBackoff spaces out retries after a failure. A rate limit answered at the
+// same rate is just more rate limiting, so the delay doubles from the normal
+// interval up to a five-minute ceiling — or honours the server's Retry-After
+// when it sent one.
+func nextBackoff(current, interval time.Duration, err error) time.Duration {
+	const ceiling = 5 * time.Minute
+
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.RetryAfter > 0 {
+		return min(apiErr.RetryAfter, ceiling)
+	}
+	if current <= 0 {
+		return interval
+	}
+	return min(current*2, ceiling)
+}
+
+// errorLine renders an error as one line: the card is a fixed-width box and a
+// multi-line JSON body breaks out of it.
+func errorLine(err error) string {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.IsRateLimit() {
+		return "Rate limited — backing off"
+	}
+	return "Error: " + strings.Join(strings.Fields(err.Error()), " ")
+}
+
+func truncate(s string, width int) string {
+	r := []rune(s)
+	if len(r) <= width {
+		return s
+	}
+	if width <= 1 {
+		return string(r[:width])
+	}
+	return string(r[:width-1]) + "…"
 }

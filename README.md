@@ -96,7 +96,7 @@ go build -o claude-usage-monitor .
 ## Usage
 
 ```bash
-claude-usage-monitor                       # interactive TUI, refreshes every 30s
+claude-usage-monitor                       # interactive TUI, refreshes every minute
 claude-usage-monitor --interval 1m         # custom refresh interval
 claude-usage-monitor --ping-interval 0     # no health ping (usage data only)
 claude-usage-monitor --once                # one-shot plain text
@@ -143,8 +143,13 @@ If you don't have Claude Code installed, log in once at <https://claude.ai/code>
 
 ## Cost
 
-Reading usage costs nothing — it is a GET, not an inference call, so the 30-second
-refresh is free.
+Reading usage costs nothing — it is a GET, not an inference call, so the refresh
+loop is free.
+
+It is not unlimited, though: the endpoint has its own request budget and answers
+`429` if polled too hard. The default interval is one minute, and a failed fetch
+backs off — the server's `Retry-After` when it sends one, otherwise doubling from
+the interval up to five minutes, reset by the first success.
 
 The health ping is a real request (8 input tokens, 1 output token) and does land in
 the 5-hour window this tool reports. At the default 30-minute interval that is 48

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -69,6 +70,47 @@ func loadCredentials() (*Credentials, error) {
 		return nil, fmt.Errorf("parse credentials: %w", err)
 	}
 	return &creds, nil
+}
+
+// APIError is a non-200 from the API, kept structured so callers can tell a
+// rate limit from a real failure and can honour a server-set retry delay.
+type APIError struct {
+	Status     int
+	Message    string
+	RetryAfter time.Duration
+}
+
+func (e *APIError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("HTTP %d", e.Status)
+	}
+	return e.Message
+}
+
+func (e *APIError) IsRateLimit() bool { return e.Status == 429 }
+
+// apiError reads the body once and pulls out the human-readable message.
+// Anthropic errors are {"error":{"type":..,"message":..}}; anything else is
+// quoted raw, on one line, so a stray HTML page cannot wreck the card.
+func apiError(resp *http.Response) *APIError {
+	e := &APIError{Status: resp.StatusCode}
+	if v := resp.Header.Get("Retry-After"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+			e.RetryAfter = time.Duration(secs) * time.Second
+		}
+	}
+	raw := readSnippet(resp.Body)
+	var body struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(raw), &body) == nil && body.Error.Message != "" {
+		e.Message = body.Error.Message
+		return e
+	}
+	e.Message = strings.Join(strings.Fields(raw), " ")
+	return e
 }
 
 // apiBase is the API root. A variable so tests can point it at httptest.
@@ -155,7 +197,7 @@ func fetchProfile() (*Profile, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("profile returned %d: %s", resp.StatusCode, readSnippet(resp.Body))
+		return nil, apiError(resp)
 	}
 
 	// The endpoint also carries name and email. Only the plan is decoded —
@@ -211,7 +253,7 @@ func fetchUsage() (*RateLimitInfo, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("usage returned %d: %s", resp.StatusCode, readSnippet(resp.Body))
+		return nil, apiError(resp)
 	}
 
 	var p usagePayload

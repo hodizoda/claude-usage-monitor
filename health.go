@@ -67,9 +67,9 @@ func probeHealth() Health {
 	case resp.StatusCode == 429:
 		h.Kind, h.Detail = HealthLimited, "rate limited"
 	case resp.StatusCode == 401 || resp.StatusCode == 403:
-		h.Kind, h.Detail = HealthAuth, readSnippet(resp.Body)
+		h.Kind, h.Detail = HealthAuth, apiError(resp).Error()
 	default:
-		h.Kind, h.Detail = HealthDown, fmt.Sprintf("%d: %s", resp.StatusCode, readSnippet(resp.Body))
+		h.Kind, h.Detail = HealthDown, fmt.Sprintf("%d: %s", resp.StatusCode, apiError(resp).Error())
 	}
 	return h
 }

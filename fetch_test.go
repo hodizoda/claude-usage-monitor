@@ -1,12 +1,14 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A trimmed copy of a real GET /api/oauth/usage response. Percentages arrive
@@ -199,5 +201,51 @@ func TestPlanLabel(t *testing.T) {
 		if got := planLabel(c.sub, c.tier); got != c.want {
 			t.Errorf("planLabel(%q, %q) = %q, want %q", c.sub, c.tier, got, c.want)
 		}
+	}
+}
+
+// A 429 on the usage endpoint must arrive as a structured error: the raw body
+// is multi-line JSON, which broke the fixed-width card when rendered verbatim.
+func TestFetchUsageRateLimitIsStructured(t *testing.T) {
+	writeCreds(t, "t")
+	serveUsage(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "45")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte("{\n \"error\": {\n  \"type\": \"rate_limit_error\",\n  \"message\": \"Rate limited. Please try again later.\"\n }\n}"))
+	})
+
+	_, err := fetchUsage()
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %T (%v), want *APIError", err, err)
+	}
+	if !apiErr.IsRateLimit() {
+		t.Errorf("status = %d, want it recognised as a rate limit", apiErr.Status)
+	}
+	if apiErr.RetryAfter != 45*time.Second {
+		t.Errorf("retry after = %v, want 45s from the header", apiErr.RetryAfter)
+	}
+	if apiErr.Error() != "Rate limited. Please try again later." {
+		t.Errorf("message = %q, want the API's message alone", apiErr.Error())
+	}
+	if strings.Contains(apiErr.Error(), "\n") {
+		t.Error("message spans lines; the card is a fixed-width box")
+	}
+}
+
+// A body that is not Anthropic's error shape must still collapse to one line.
+func TestAPIErrorFlattensUnknownBodies(t *testing.T) {
+	writeCreds(t, "t")
+	serveUsage(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		w.Write([]byte("<html>\n<body>\n502 Bad Gateway\n</body>\n</html>"))
+	})
+
+	_, err := fetchUsage()
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("error = %q, want it flattened to one line", err.Error())
 	}
 }

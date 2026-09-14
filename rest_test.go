@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"regexp"
 	"strings"
 	"testing"
@@ -104,3 +105,49 @@ var (
 )
 
 func stripANSI(s string) string { return ansiRE.ReplaceAllString(s, "") }
+
+func TestNextBackoffSpacesOutRetries(t *testing.T) {
+	interval := 30 * time.Second
+	plain := errors.New("boom")
+
+	// First failure waits the normal interval, then doubles, then stops at the
+	// ceiling — answering a rate limit at the same rate is more rate limiting.
+	first := nextBackoff(0, interval, plain)
+	if first != interval {
+		t.Errorf("first backoff = %v, want %v", first, interval)
+	}
+	if got := nextBackoff(first, interval, plain); got != time.Minute {
+		t.Errorf("second backoff = %v, want 1m", got)
+	}
+	if got := nextBackoff(4*time.Minute, interval, plain); got != 5*time.Minute {
+		t.Errorf("capped backoff = %v, want the 5m ceiling", got)
+	}
+
+	// A server-set Retry-After wins over the doubling.
+	limited := &APIError{Status: 429, RetryAfter: 45 * time.Second}
+	if got := nextBackoff(4*time.Minute, interval, limited); got != 45*time.Second {
+		t.Errorf("backoff = %v, want the server's 45s", got)
+	}
+	// ...but not past the ceiling.
+	long := &APIError{Status: 429, RetryAfter: time.Hour}
+	if got := nextBackoff(0, interval, long); got != 5*time.Minute {
+		t.Errorf("backoff = %v, want it clamped to 5m", got)
+	}
+}
+
+// The card is a fixed-width box: a multi-line JSON body must never reach it.
+func TestViewKeepsRateLimitErrorInsideTheCard(t *testing.T) {
+	m := newModel("max", "default_claude_max_20x", 30*time.Second, 30*time.Minute)
+	m.fetching = false
+	m.err = &APIError{Status: 429, Message: "Rate limited. Please try again later."}
+	m.nextFetchAt = time.Now().Add(30 * time.Second)
+
+	for _, line := range strings.Split(m.View(), "\n") {
+		if lipgloss.Width(line) > 70 {
+			t.Errorf("line escapes the card (%d cols): %q", lipgloss.Width(line), line)
+		}
+	}
+	if out := m.View(); !strings.Contains(out, "Rate limited") || !strings.Contains(out, "Retrying in") {
+		t.Errorf("view should say it is rate limited and when it retries:\n%s", out)
+	}
+}

@@ -17,7 +17,9 @@ func main() {
 	once := flag.Bool("once", false, "Print usage once and exit (no TUI)")
 	jsonOut := flag.Bool("json", false, "Print usage as JSON and exit (implies --once)")
 	preview := flag.Bool("preview", false, "Render one frame of the TUI to stdout and exit")
-	interval := flag.Duration("interval", 30*time.Second, "Refresh interval for TUI mode")
+	// 30s polling earns a 429 from the usage endpoint's own budget; the numbers
+	// move slowly enough that a minute loses nothing.
+	interval := flag.Duration("interval", time.Minute, "Refresh interval for TUI mode")
 	// The usage read is a free GET; the health ping is a real inference call
 	// that lands in the 5-hour window, so it gets its own, slower clock.
 	pingInterval := flag.Duration("ping-interval", 30*time.Minute, "How often to ping Haiku to check the API is up (0 disables)")
