@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // servePage points the status-page client at a stub returning this indicator.
@@ -108,5 +110,30 @@ func TestProbeHealthUsesMinimalRequest(t *testing.T) {
 	}
 	if !strings.Contains(body, "haiku") {
 		t.Errorf("body = %q, want the haiku model", body)
+	}
+}
+
+// The JSON field is named latency_ms. time.Duration marshals as nanoseconds,
+// which put 621000000 under that key for a 621ms round trip.
+func TestHealthJSONLatencyIsMilliseconds(t *testing.T) {
+	writeCreds(t, "t")
+	servePage(t, "none", "All Systems Operational")
+	serveUsage(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(30 * time.Millisecond)
+		w.WriteHeader(200)
+	})
+
+	b, err := json.Marshal(probeHealth())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		LatencyMS int64 `json:"latency_ms"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.LatencyMS < 30 || out.LatencyMS > 5000 {
+		t.Errorf("latency_ms = %d for a ~30ms round trip: %s", out.LatencyMS, b)
 	}
 }

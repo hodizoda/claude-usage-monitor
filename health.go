@@ -31,9 +31,11 @@ type PageStatus struct {
 type Health struct {
 	Kind    HealthKind    `json:"kind"`
 	Detail  string        `json:"detail,omitempty"`
-	Latency time.Duration `json:"latency_ms"`
-	At      time.Time     `json:"checked_at"`
-	Page    *PageStatus   `json:"status_page,omitempty"`
+	Latency time.Duration `json:"-"`
+	// time.Duration marshals as nanoseconds; the JSON field promises milliseconds.
+	LatencyMS int64       `json:"latency_ms"`
+	At        time.Time   `json:"checked_at"`
+	Page      *PageStatus `json:"status_page,omitempty"`
 }
 
 // probeHealth sends the smallest possible inference request and classifies the
@@ -55,6 +57,7 @@ func probeHealth() Health {
 	start := time.Now()
 	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
 	h.Latency = time.Since(start)
+	h.LatencyMS = h.Latency.Milliseconds()
 	if err != nil {
 		h.Kind, h.Detail = HealthDown, err.Error()
 		return h
