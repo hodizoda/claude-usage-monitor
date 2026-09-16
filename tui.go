@@ -71,7 +71,7 @@ type fetchResultMsg struct {
 type model struct {
 	subscription string
 	tier         string
-	interval     time.Duration
+	intervals    []time.Duration
 
 	info        *RateLimitInfo
 	err         error
@@ -81,27 +81,25 @@ type model struct {
 	quit        bool
 
 	// Set after a rate-limited or failed fetch: the next attempt waits this
-	// long instead of the normal interval, so a 429 is not answered by more
+	// long instead of a normal interval, so a 429 is not answered by more
 	// requests at the same rate.
 	backoff time.Duration
 
 	// The health ping costs tokens and lands in the 5-hour window this tool
 	// reports, so it runs on its own, much slower clock. Zero disables it.
-	jitter       time.Duration
 	pingInterval time.Duration
 	health       *Health
 	pinging      bool
 	nextPingAt   time.Time
 }
 
-func newModel(subscription, tier string, interval, jitter, pingInterval time.Duration) model {
+func newModel(subscription, tier string, intervals []time.Duration, pingInterval time.Duration) model {
 	return model{
 		subscription: subscription,
 		tier:         tier,
-		interval:     interval,
-		jitter:       jitter,
+		intervals:    intervals,
 		fetching:     true,
-		nextFetchAt:  time.Now().Add(nextInterval(interval, jitter)),
+		nextFetchAt:  time.Now().Add(pickInterval(intervals)),
 		pingInterval: pingInterval,
 		pinging:      pingInterval > 0,
 		nextPingAt:   time.Now().Add(pingInterval),
@@ -140,7 +138,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			if !m.fetching {
 				m.fetching = true
-				m.nextFetchAt = time.Now().Add(nextInterval(m.interval, m.jitter))
+				m.nextFetchAt = time.Now().Add(pickInterval(m.intervals))
 				return m, m.fetchCmd()
 			}
 		}
@@ -150,13 +148,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastFetch = time.Now()
 		if msg.err != nil {
 			m.err = msg.err
-			m.backoff = nextBackoff(m.backoff, m.interval, msg.err)
+			m.backoff = nextBackoff(m.backoff, pickInterval(m.intervals), msg.err)
 			m.nextFetchAt = m.lastFetch.Add(m.backoff)
 		} else {
 			m.err = nil
 			m.info = msg.info
 			m.backoff = 0
-			m.nextFetchAt = m.lastFetch.Add(nextInterval(m.interval, m.jitter))
+			m.nextFetchAt = m.lastFetch.Add(pickInterval(m.intervals))
 		}
 
 	case healthMsg:
@@ -358,8 +356,8 @@ func (m model) View() string {
 	return cardStyle.Render(strings.Join(lines, "\n"))
 }
 
-func runTUI(subscription, tier string, interval, jitter, pingInterval time.Duration) error {
-	m := newModel(subscription, tier, interval, jitter, pingInterval)
+func runTUI(subscription, tier string, intervals []time.Duration, pingInterval time.Duration) error {
+	m := newModel(subscription, tier, intervals, pingInterval)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
 	return err
@@ -390,20 +388,22 @@ func formatAgo(t time.Time) string {
 }
 
 // nextBackoff spaces out retries after a failure. A rate limit answered at the
-// same rate is just more rate limiting, so the delay doubles from the normal
-// interval up to a five-minute ceiling — or honours the server's Retry-After
-// when it sent one.
+// same rate is just more rate limiting, so the delay starts at a normal
+// interval and doubles to a thirty-minute ceiling. Retry-After can lengthen the
+// wait but never shorten it: a server saying "retry now" to a client it just
+// refused is not a reason to poll faster than usual.
 func nextBackoff(current, interval time.Duration, err error) time.Duration {
-	const ceiling = 5 * time.Minute
+	const ceiling = 30 * time.Minute
 
+	next := interval
+	if current > 0 {
+		next = current * 2
+	}
 	var apiErr *APIError
-	if errors.As(err, &apiErr) && apiErr.RetryAfter > 0 {
-		return min(apiErr.RetryAfter, ceiling)
+	if errors.As(err, &apiErr) && apiErr.RetryAfter > next {
+		next = apiErr.RetryAfter
 	}
-	if current <= 0 {
-		return interval
-	}
-	return min(current*2, ceiling)
+	return min(next, ceiling)
 }
 
 // errorLine renders an error as one line: the card is a fixed-width box and a
@@ -427,12 +427,34 @@ func truncate(s string, width int) string {
 	return string(r[:width-1]) + "…"
 }
 
-// nextInterval spreads the refresh over [interval, interval+jitter]. A fixed
-// period lines up with everything else polling the same endpoint — Claude Code
-// reads it too — and aligned clients are what turn a shared budget into a 429.
-func nextInterval(interval, jitter time.Duration) time.Duration {
-	if jitter <= 0 {
-		return interval
+// pickInterval draws the next refresh delay from the configured set. The usage
+// endpoint has a small request budget shared with Claude Code's own polling;
+// a varied, minutes-long cadence stays under it, and aligned fixed periods are
+// what trip it. Manual refresh covers the moments a fresher number matters.
+func pickInterval(choices []time.Duration) time.Duration {
+	return choices[rand.IntN(len(choices))]
+}
+
+// parseIntervals reads "3m,5m,8m,13m". A single value is a fixed period.
+func parseIntervals(s string) ([]time.Duration, error) {
+	var out []time.Duration
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		d, err := time.ParseDuration(part)
+		if err != nil {
+			return nil, fmt.Errorf("interval %q: %w", part, err)
+		}
+		if d < 10*time.Second {
+			// Below this the endpoint's budget is gone within minutes.
+			return nil, fmt.Errorf("interval %q is under the 10s minimum", part)
+		}
+		out = append(out, d)
 	}
-	return interval + time.Duration(rand.Int64N(int64(jitter)+1))
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no refresh interval given")
+	}
+	return out, nil
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -57,7 +58,7 @@ func TestRestMessageCountsDown(t *testing.T) {
 // The card has to actually reach the screen: a limited ping must render the
 // cat and the countdown, not the ordinary health line.
 func TestViewShowsCoolDownCardWhenLimited(t *testing.T) {
-	m := newModel("max", "default_claude_max_5x", 30*time.Second, 20*time.Second, 30*time.Minute)
+	m := newModel("max", "default_claude_max_5x", testIntervals, 30*time.Minute)
 	m.fetching = false
 	m.info = &RateLimitInfo{
 		FiveHour: Window{Utilization: 1, Reset: time.Now().Add(90 * time.Minute).Unix()},
@@ -109,38 +110,53 @@ var (
 
 func stripANSI(s string) string { return ansiRE.ReplaceAllString(s, "") }
 
+var testIntervals = []time.Duration{3 * time.Minute, 5 * time.Minute, 8 * time.Minute, 13 * time.Minute}
+
 func TestNextBackoffSpacesOutRetries(t *testing.T) {
-	interval := 30 * time.Second
+	interval := 5 * time.Minute
 	plain := errors.New("boom")
 
-	// First failure waits the normal interval, then doubles, then stops at the
+	// First failure waits a normal interval, then doubles, then stops at the
 	// ceiling — answering a rate limit at the same rate is more rate limiting.
 	first := nextBackoff(0, interval, plain)
 	if first != interval {
 		t.Errorf("first backoff = %v, want %v", first, interval)
 	}
-	if got := nextBackoff(first, interval, plain); got != time.Minute {
-		t.Errorf("second backoff = %v, want 1m", got)
+	if got := nextBackoff(first, interval, plain); got != 10*time.Minute {
+		t.Errorf("second backoff = %v, want 10m", got)
 	}
-	if got := nextBackoff(4*time.Minute, interval, plain); got != 5*time.Minute {
-		t.Errorf("capped backoff = %v, want the 5m ceiling", got)
+	if got := nextBackoff(20*time.Minute, interval, plain); got != 30*time.Minute {
+		t.Errorf("capped backoff = %v, want the 30m ceiling", got)
 	}
 
-	// A server-set Retry-After wins over the doubling.
-	limited := &APIError{Status: 429, RetryAfter: 45 * time.Second}
-	if got := nextBackoff(4*time.Minute, interval, limited); got != 45*time.Second {
-		t.Errorf("backoff = %v, want the server's 45s", got)
+	// The ceiling must sit above every normal interval, or an error would
+	// make the loop poll faster than it does when healthy.
+	for _, d := range testIntervals {
+		if got := nextBackoff(d, d, plain); got < d {
+			t.Errorf("backoff after a %v interval = %v, shorter than normal", d, got)
+		}
 	}
-	// ...but not past the ceiling.
-	long := &APIError{Status: 429, RetryAfter: time.Hour}
-	if got := nextBackoff(0, interval, long); got != 5*time.Minute {
-		t.Errorf("backoff = %v, want it clamped to 5m", got)
+
+	// Retry-After may lengthen the wait...
+	longer := &APIError{Status: 429, RetryAfter: 20 * time.Minute}
+	if got := nextBackoff(0, interval, longer); got != 20*time.Minute {
+		t.Errorf("backoff = %v, want the server's 20m", got)
+	}
+	// ...but never shorten it below what the client would wait anyway.
+	shorter := &APIError{Status: 429, RetryAfter: 45 * time.Second}
+	if got := nextBackoff(0, interval, shorter); got != interval {
+		t.Errorf("backoff = %v, want %v despite a 45s Retry-After", got, interval)
+	}
+	// ...and never past the ceiling.
+	huge := &APIError{Status: 429, RetryAfter: 2 * time.Hour}
+	if got := nextBackoff(0, interval, huge); got != 30*time.Minute {
+		t.Errorf("backoff = %v, want it clamped to 30m", got)
 	}
 }
 
 // The card is a fixed-width box: a multi-line JSON body must never reach it.
 func TestViewKeepsRateLimitErrorInsideTheCard(t *testing.T) {
-	m := newModel("max", "default_claude_max_20x", 30*time.Second, 20*time.Second, 30*time.Minute)
+	m := newModel("max", "default_claude_max_20x", testIntervals, 30*time.Minute)
 	m.fetching = false
 	m.err = &APIError{Status: 429, Message: "Rate limited. Please try again later."}
 	m.nextFetchAt = time.Now().Add(30 * time.Second)
@@ -158,7 +174,7 @@ func TestViewKeepsRateLimitErrorInsideTheCard(t *testing.T) {
 // The pet has to appear on the data alone. Waiting for a ping to be refused
 // means it only shows up after the interruption it is warning about.
 func TestViewShowsPetWhenAWindowIsSpent(t *testing.T) {
-	m := newModel("max", "default_claude_max_20x", 30*time.Second, 20*time.Second, 30*time.Minute)
+	m := newModel("max", "default_claude_max_20x", testIntervals, 30*time.Minute)
 	m.fetching = false
 	healthy := Health{Kind: HealthOK, At: time.Now()}
 	m.health = &healthy
@@ -196,30 +212,43 @@ func TestCappedIgnoresEmptyInfo(t *testing.T) {
 	}
 }
 
-// Every refresh must land inside [interval, interval+jitter], and must not
-// always land on the same value — a fixed period is what aligns this client
-// with everything else polling the endpoint.
-func TestNextIntervalStaysInRangeAndVaries(t *testing.T) {
-	const (
-		base   = 30 * time.Second
-		jitter = 20 * time.Second
-	)
-	seen := map[time.Duration]bool{}
-	for i := 0; i < 500; i++ {
-		d := nextInterval(base, jitter)
-		if d < base || d > base+jitter {
-			t.Fatalf("interval %v outside [%v, %v]", d, base, base+jitter)
-		}
-		seen[d] = true
+// Every refresh must come from the configured set, and all of the set must be
+// reachable — a draw stuck on one value is a fixed period again.
+func TestPickIntervalDrawsFromTheWholeSet(t *testing.T) {
+	seen := map[time.Duration]int{}
+	for i := 0; i < 2000; i++ {
+		d := pickInterval(testIntervals)
+		seen[d]++
 	}
-	if len(seen) < 10 {
-		t.Errorf("%d distinct delays in 500 draws, want a spread", len(seen))
+	for d := range seen {
+		if !slices.Contains(testIntervals, d) {
+			t.Fatalf("drew %v, which is not in the set", d)
+		}
+	}
+	if len(seen) != len(testIntervals) {
+		t.Errorf("drew %d of %d intervals in 2000 picks: %v", len(seen), len(testIntervals), seen)
 	}
 
-	// Zero jitter is a fixed period, for anyone who wants one.
-	for i := 0; i < 10; i++ {
-		if d := nextInterval(base, 0); d != base {
-			t.Fatalf("interval %v with no jitter, want %v", d, base)
+	if got := pickInterval([]time.Duration{time.Minute}); got != time.Minute {
+		t.Errorf("single interval = %v, want a fixed 1m", got)
+	}
+}
+
+func TestParseIntervals(t *testing.T) {
+	got, err := parseIntervals("3m, 5m,8m,13m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, testIntervals) {
+		t.Errorf("parsed %v, want %v", got, testIntervals)
+	}
+	if got, err := parseIntervals("90s"); err != nil || !slices.Equal(got, []time.Duration{90 * time.Second}) {
+		t.Errorf("single value = %v, %v", got, err)
+	}
+	// Bad input fails loudly rather than falling back to something unasked for.
+	for _, bad := range []string{"", ",", "3x", "5s", "3m,-1m"} {
+		if _, err := parseIntervals(bad); err == nil {
+			t.Errorf("parseIntervals(%q) accepted bad input", bad)
 		}
 	}
 }
