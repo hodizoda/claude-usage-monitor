@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,29 +8,42 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
-// RateLimitInfo is parsed from the Anthropic API's response headers.
+// Window is one rate-limit window: how much of it is spent, and when it resets.
+type Window struct {
+	Utilization float64 `json:"utilization"` // 0..1
+	Reset       int64   `json:"reset"`       // unix seconds, 0 when unknown
+}
+
+// ScopedLimit is a weekly limit that applies to one model only — the
+// "Current week (Fable)" row in the /usage panel.
+type ScopedLimit struct {
+	Label       string  `json:"label"`
+	Utilization float64 `json:"utilization"` // 0..1
+	Reset       int64   `json:"reset"`
+	Severity    string  `json:"severity"` // normal | warning | critical
+	Active      bool    `json:"active"`
+}
+
+// BreakdownRow is one surface's share of the weekly window.
+type BreakdownRow struct {
+	Label   string  `json:"label"`
+	Percent float64 `json:"percent"`
+}
+
 type RateLimitInfo struct {
 	Timestamp time.Time `json:"timestamp"`
 
-	Status string `json:"status"`
+	FiveHour Window `json:"five_hour"`
+	SevenDay Window `json:"seven_day"`
 
-	FiveHourStatus      string  `json:"five_hour_status"`
-	FiveHourReset       int64   `json:"five_hour_reset"`
-	FiveHourUtilization float64 `json:"five_hour_utilization"`
+	ScopedWeekly []ScopedLimit  `json:"scoped_weekly,omitempty"`
+	Breakdown    []BreakdownRow `json:"seven_day_breakdown,omitempty"`
 
-	SevenDayStatus      string  `json:"seven_day_status"`
-	SevenDayReset       int64   `json:"seven_day_reset"`
-	SevenDayUtilization float64 `json:"seven_day_utilization"`
-
-	RepresentativeClaim   string  `json:"representative_claim"`
-	FallbackPercentage    float64 `json:"fallback_percentage"`
-	OverageStatus         string  `json:"overage_status"`
-	OverageDisabledReason string  `json:"overage_disabled_reason"`
-	OverageReset          int64   `json:"overage_reset,omitempty"`
-	UpgradePaths          string  `json:"upgrade_paths,omitempty"`
+	ExtraUsageEnabled bool `json:"extra_usage_enabled"`
 }
 
 type Credentials struct {
@@ -60,61 +72,253 @@ func loadCredentials() (*Credentials, error) {
 	return &creds, nil
 }
 
-func fetchUsage(apiKey string) (*RateLimitInfo, error) {
-	body := `{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`
-	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewBufferString(body))
+// APIError is a non-200 from the API, kept structured so callers can tell a
+// rate limit from a real failure and can honour a server-set retry delay.
+type APIError struct {
+	Status     int
+	Message    string
+	RetryAfter time.Duration
+}
+
+func (e *APIError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("HTTP %d", e.Status)
+	}
+	return e.Message
+}
+
+func (e *APIError) IsRateLimit() bool { return e.Status == 429 }
+
+// apiError reads the body once and pulls out the human-readable message.
+// Anthropic errors are {"error":{"type":..,"message":..}}; anything else is
+// quoted raw, on one line, so a stray HTML page cannot wreck the card.
+func apiError(resp *http.Response) *APIError {
+	e := &APIError{Status: resp.StatusCode}
+	if v := resp.Header.Get("Retry-After"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+			e.RetryAfter = time.Duration(secs) * time.Second
+		}
+	}
+	raw := readSnippet(resp.Body)
+	var body struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(raw), &body) == nil && body.Error.Message != "" {
+		e.Message = body.Error.Message
+		return e
+	}
+	e.Message = strings.Join(strings.Fields(raw), " ")
+	return e
+}
+
+// apiBase is the API root. A variable so tests can point it at httptest.
+var apiBase = "https://api.anthropic.com"
+
+// The wire shape of GET /api/oauth/usage — the endpoint behind the CLI's
+// /usage panel. Percentages arrive on a 0..100 scale.
+type usageWindow struct {
+	Utilization float64 `json:"utilization"`
+	ResetsAt    string  `json:"resets_at"`
+}
+
+type usageLimit struct {
+	Kind     string  `json:"kind"`
+	Percent  float64 `json:"percent"`
+	Severity string  `json:"severity"`
+	ResetsAt string  `json:"resets_at"`
+	IsActive bool    `json:"is_active"`
+	Scope    *struct {
+		Model *struct {
+			DisplayName string `json:"display_name"`
+		} `json:"model"`
+	} `json:"scope"`
+}
+
+type usagePayload struct {
+	FiveHour *usageWindow `json:"five_hour"`
+	SevenDay *usageWindow `json:"seven_day"`
+	Limits   []usageLimit `json:"limits"`
+
+	ExtraUsage struct {
+		IsEnabled bool `json:"is_enabled"`
+	} `json:"extra_usage"`
+
+	SevenDayBreakdown *struct {
+		Rows []struct {
+			DisplayName string  `json:"display_name"`
+			Percent     float64 `json:"percent"`
+		} `json:"rows"`
+	} `json:"seven_day_breakdown"`
+}
+
+// authRequest builds a request carrying the subscription token. Claude Code
+// tokens are OAuth bearers, not API keys: sent as x-api-key they get a flat 401.
+// Credentials are re-read per call because Claude Code rotates the token in
+// place and a long-running TUI outlives one.
+func authRequest(method, url string, body io.Reader) (*http.Request, error) {
+	creds, err := loadCredentials()
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", apiKey)
+	token := creds.ClaudeAiOauth.AccessToken
+	if token == "" {
+		return nil, fmt.Errorf("no access token in credentials")
+	}
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 	req.Header.Set("anthropic-version", "2023-06-01")
+	return req, nil
+}
+
+// Profile is the account's plan, read from the API rather than from the
+// credentials file: that file records the tier as it was at the last login and
+// goes stale the moment the plan changes.
+type Profile struct {
+	Subscription string // "max"
+	Tier         string // "default_claude_max_20x"
+}
+
+func fetchProfile() (*Profile, error) {
+	req, err := authRequest("GET", apiBase+"/api/oauth/profile", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("profile call: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, apiError(resp)
+	}
+
+	// The endpoint also carries name and email. Only the plan is decoded —
+	// nothing else belongs in this tool's memory.
+	var body struct {
+		Organization struct {
+			OrganizationType string `json:"organization_type"`
+			RateLimitTier    string `json:"rate_limit_tier"`
+		} `json:"organization"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("parse profile: %w", err)
+	}
+	return &Profile{
+		Subscription: strings.TrimPrefix(body.Organization.OrganizationType, "claude_"),
+		Tier:         body.Organization.RateLimitTier,
+	}, nil
+}
+
+// planLabel renders the footer's plan, e.g. "max (20x)".
+func planLabel(subscription, tier string) string {
+	if subscription == "" {
+		subscription = "unknown"
+	}
+	if tier == "" {
+		return subscription
+	}
+	// "default_claude_max_20x" -> "20x"
+	if i := strings.LastIndex(tier, "_"); i >= 0 {
+		tier = tier[i+1:]
+	}
+	if tier == "" || tier == subscription {
+		return subscription
+	}
+	return subscription + " (" + tier + ")"
+}
+
+// fetchUsage reads the usage panel's own endpoint. It is a plain GET: no
+// inference call, so it costs nothing and does not inflate the numbers it
+// reports.
+func fetchUsage() (*RateLimitInfo, error) {
+	req, err := authRequest("GET", apiBase+"/api/oauth/usage", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("api call: %w", err)
+		return nil, fmt.Errorf("usage call: %w", err)
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("api returned %d", resp.StatusCode)
+		return nil, apiError(resp)
 	}
 
-	h := resp.Header
-	return &RateLimitInfo{
-		Timestamp:             time.Now(),
-		Status:                h.Get("anthropic-ratelimit-unified-status"),
-		FiveHourStatus:        h.Get("anthropic-ratelimit-unified-5h-status"),
-		FiveHourReset:         parseUnix(h.Get("anthropic-ratelimit-unified-5h-reset")),
-		FiveHourUtilization:   parseFloat(h.Get("anthropic-ratelimit-unified-5h-utilization")),
-		SevenDayStatus:        h.Get("anthropic-ratelimit-unified-7d-status"),
-		SevenDayReset:         parseUnix(h.Get("anthropic-ratelimit-unified-7d-reset")),
-		SevenDayUtilization:   parseFloat(h.Get("anthropic-ratelimit-unified-7d-utilization")),
-		RepresentativeClaim:   h.Get("anthropic-ratelimit-unified-representative-claim"),
-		FallbackPercentage:    parseFloat(h.Get("anthropic-ratelimit-unified-fallback-percentage")),
-		OverageStatus:         h.Get("anthropic-ratelimit-unified-overage-status"),
-		OverageDisabledReason: h.Get("anthropic-ratelimit-unified-overage-disabled-reason"),
-		OverageReset:          parseUnix(h.Get("anthropic-ratelimit-unified-overage-reset")),
-		UpgradePaths:          h.Get("anthropic-ratelimit-unified-upgrade-paths"),
-	}, nil
+	var p usagePayload
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		return nil, fmt.Errorf("parse usage: %w", err)
+	}
+	return buildInfo(&p), nil
 }
 
-func parseUnix(s string) int64 {
+func buildInfo(p *usagePayload) *RateLimitInfo {
+	info := &RateLimitInfo{
+		Timestamp:         time.Now(),
+		FiveHour:          window(p.FiveHour),
+		SevenDay:          window(p.SevenDay),
+		ExtraUsageEnabled: p.ExtraUsage.IsEnabled,
+	}
+	for _, l := range p.Limits {
+		// weekly_scoped is the per-model row; every other kind duplicates a
+		// window we already read from the top-level fields.
+		if l.Kind != "weekly_scoped" || l.Scope == nil || l.Scope.Model == nil {
+			continue
+		}
+		info.ScopedWeekly = append(info.ScopedWeekly, ScopedLimit{
+			Label:       l.Scope.Model.DisplayName,
+			Utilization: l.Percent / 100,
+			Reset:       parseRFC3339(l.ResetsAt),
+			Severity:    l.Severity,
+			Active:      l.IsActive,
+		})
+	}
+	if p.SevenDayBreakdown != nil {
+		for _, r := range p.SevenDayBreakdown.Rows {
+			info.Breakdown = append(info.Breakdown, BreakdownRow{Label: r.DisplayName, Percent: r.Percent})
+		}
+	}
+	return info
+}
+
+func window(w *usageWindow) Window {
+	if w == nil {
+		return Window{}
+	}
+	return Window{Utilization: w.Utilization / 100, Reset: parseRFC3339(w.ResetsAt)}
+}
+
+func parseRFC3339(s string) int64 {
 	if s == "" {
 		return 0
 	}
-	n, _ := strconv.ParseInt(s, 10, 64)
-	return n
-}
-
-func parseFloat(s string) float64 {
-	if s == "" {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
 		return 0
 	}
-	f, _ := strconv.ParseFloat(s, 64)
-	return f
+	return t.Unix()
+}
+
+// readSnippet quotes an error body without letting a large one reach the terminal.
+func readSnippet(r io.Reader) string {
+	b, _ := io.ReadAll(io.LimitReader(r, 400))
+	for i, c := range b {
+		if c < 0x20 && c != '\n' && c != '\t' {
+			b[i] = ' '
+		}
+	}
+	return string(b)
 }
 
 // formatResetRelative returns e.g. "3 hr 45 min" or "6 days".
@@ -153,6 +357,5 @@ func formatResetAbsolute(unix int64) string {
 	if unix == 0 {
 		return "—"
 	}
-	t := time.Unix(unix, 0).Local()
-	return t.Format("Mon at 3:04 PM")
+	return time.Unix(unix, 0).Local().Format("Mon at 3:04 PM")
 }

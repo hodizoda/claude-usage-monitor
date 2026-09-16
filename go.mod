@@ -1,6 +1,6 @@
 module github.com/hodizoda/claude-usage-monitor
 
-go 1.26
+go 1.26.0
 
 require (
 	github.com/charmbracelet/bubbletea v1.3.10
